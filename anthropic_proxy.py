@@ -619,7 +619,7 @@ async def messages_endpoint(request: Request):
 
         # 检查是否为流式请求
         is_stream = request_data.get('stream', False)
-        request_data.pop("top_p")
+        request_data.pop("top_p", None)
 
         # 获取请求头
         headers = dict(request.headers)
