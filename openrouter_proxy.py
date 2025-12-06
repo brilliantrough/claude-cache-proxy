@@ -235,8 +235,8 @@ class OpenAIRequestHandler:
         cached_request['messages'] = cached_messages
 
         # 转换 thinking 字段为 reasoning 字段（OpenRouter 格式）
-        claude_reasoning = cached_request.get("thinking", {"enabled": True, "budget_tokens": 3276})
-        cached_request['reasoning'] = {"enabled": claude_reasoning['enabled'], "max_tokens": claude_reasoning['budget_tokens']}
+        claude_reasoning = cached_request.get("thinking", {"type": "disabled", "budget_tokens": 3276})
+        cached_request['reasoning'] = {"enabled": claude_reasoning['type'] == "enabled", "max_tokens": claude_reasoning['budget_tokens']}
 
         logger.info("Stream request processed with OpenRouter cache_control strategy")
 
