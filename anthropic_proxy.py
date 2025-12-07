@@ -634,6 +634,7 @@ async def messages_endpoint(request: Request):
                 "type": "enabled",
                 "budget_tokens": 8192
             }
+            request_data['max_tokens'] = 16384
 
             logger.info(f"Processed thinking model: {model_name} -> {base_model} with thinking enabled")
 
