@@ -620,6 +620,7 @@ async def messages_endpoint(request: Request):
         # 检查是否为流式请求
         is_stream = request_data.get('stream', False)
         request_data.pop("top_p", None)
+        request_data.pop("temperature", None)
 
         # 预处理模型名称：处理-thinking结尾的模型
         model_name = request_data.get('model', '')
@@ -633,7 +634,6 @@ async def messages_endpoint(request: Request):
                 "type": "enabled",
                 "budget_tokens": 8192
             }
-            request_data["temperature"] = 1
 
             logger.info(f"Processed thinking model: {model_name} -> {base_model} with thinking enabled")
 
