@@ -621,6 +621,21 @@ async def messages_endpoint(request: Request):
         is_stream = request_data.get('stream', False)
         request_data.pop("top_p", None)
 
+        # 预处理模型名称：处理-thinking结尾的模型
+        model_name = request_data.get('model', '')
+        if model_name.endswith('-thinking'):
+            # 去掉"-thinking"后缀
+            base_model = model_name[:-len('-thinking')]
+            request_data['model'] = base_model
+
+            # 添加thinking参数
+            request_data['thinking'] = {
+                "type": "enabled",
+                "budget_tokens": 8192
+            }
+
+            logger.info(f"Processed thinking model: {model_name} -> {base_model} with thinking enabled")
+
         # 获取请求头
         headers = dict(request.headers)
 
