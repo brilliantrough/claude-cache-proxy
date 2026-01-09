@@ -81,44 +81,53 @@ class AnthropicRequestHandler:
 
         return headers
 
-    def _standardize_cache_control(self, messages: list) -> list:
-        """标准化所有消息的 cache_control 策略
-        - 清理所有消息的 cache_control
-        - 只在最后一条消息添加标准的 cache_control
+    def _remove_cache_control_recursive(self, data) -> None:
+        """递归地从数据结构中移除所有 cache_control 字段
+
+        处理的数据结构类型：
+        - dict: 移除 cache_control 键，并递归处理所有值
+        - list: 递归处理所有元素
+        - 其他: 忽略
+
+        注意：此函数直接修改传入的数据（in-place）
         """
-        logger.info(f"{messages}")
-        if not messages:
-            return messages
+        if isinstance(data, dict):
+            # 移除当前字典级别的 cache_control
+            if 'cache_control' in data:
+                del data['cache_control']
+            # 递归处理所有值
+            for value in data.values():
+                self._remove_cache_control_recursive(value)
+        elif isinstance(data, list):
+            # 递归处理列表中的每个元素
+            for item in data:
+                self._remove_cache_control_recursive(item)
+        # 其他类型（str, int, bool, None等）忽略
 
-        standardized_messages = []
+    def _standardize_cache_control(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """标准化请求中的 cache_control 策略
 
-        # 处理所有消息的 cache_control
-        for i, message in enumerate(messages):
-            cleaned_message = message.copy()
+        1. 递归清理所有位置的 cache_control（包括 system、messages 等）
+        2. 只在最后一条消息的最后添加标准的 cache_control
 
-            # 清理 message 级别的 cache_control
-            if 'cache_control' in cleaned_message:
-                del cleaned_message['cache_control']
+        Args:
+            request_data: 完整的请求数据
 
-            # 清理 content 级别的 cache_control
-            content = message.get('content', [])
-            if isinstance(content, list):
-                cleaned_content = []
-                for content_block in content:
-                    if isinstance(content_block, dict):
-                        # 移除 cache_control 字段，保留其他字段
-                        cleaned_block = {k: v for k, v in content_block.items() if k != 'cache_control'}
-                        cleaned_content.append(cleaned_block)
-                    else:
-                        cleaned_content.append(content_block)
-                cleaned_message['content'] = cleaned_content
-            # 字符串内容保持不变（不包含 cache_control）
+        Returns:
+            处理后的请求数据
+        """
+        logger.info(f"Original request keys: {request_data.keys()}")
 
-            standardized_messages.append(cleaned_message)
+        # 创建请求的深拷贝，避免修改原始数据
+        standardized_request = request_data.copy()
 
-        # 在最后一条消息添加标准的 cache_control
-        if standardized_messages:
-            last_message = standardized_messages[-1]
+        # 第一步：递归删除所有位置的 cache_control
+        self._remove_cache_control_recursive(standardized_request)
+
+        # 第二步：在 messages 的最后一条消息添加 cache_control
+        messages = standardized_request.get('messages', [])
+        if messages:
+            last_message = messages[-1]
             content = last_message.get('content', [])
 
             if isinstance(content, list):
@@ -136,7 +145,7 @@ class AnthropicRequestHandler:
                         })
                 else:
                     # 如果 content 为空，创建新的 content 块
-                    content = [{
+                    last_message['content'] = [{
                         "type": "text",
                         "text": "",
                         "cache_control": {"type": "ephemeral", "ttl": self.cache_control_ttl}
@@ -161,8 +170,8 @@ class AnthropicRequestHandler:
                 ]
 
         logger.info(f"Standardized cache_control: cleared all cache_control, added TTL={self.cache_control_ttl} to last message")
-        logger.info(standardized_messages)
-        return standardized_messages
+        logger.info(f"Standardized request keys: {standardized_request.keys()}")
+        return standardized_request
 
     def _has_cache_control(self, messages: list) -> bool:
         """检查消息是否包含缓存控制"""
@@ -215,14 +224,9 @@ class AnthropicRequestHandler:
         if not self._validate_anthropic_request(request_data):
             raise ValueError("Invalid Anthropic request format")
 
-        messages = request_data.get('messages', [])
-
-        # 标准化缓存策略：清理所有 cache_control，只在最后一条添加标准配置
-        standardized_messages = self._standardize_cache_control(messages)
-
-        # 更新请求中的消息
-        standardized_request = request_data.copy()
-        standardized_request['messages'] = standardized_messages
+        # 标准化缓存策略：清理所有 cache_control（包括 system、messages 等），
+        # 只在最后一条消息添加标准配置
+        standardized_request = self._standardize_cache_control(request_data)
 
         logger.info("Request processed with standardized cache_control strategy")
 
@@ -239,14 +243,9 @@ class AnthropicRequestHandler:
         if not self._validate_anthropic_request(request_data):
             raise ValueError("Invalid Anthropic request format")
 
-        messages = request_data.get('messages', [])
-
-        # 标准化缓存策略：清理所有 cache_control，只在最后一条添加标准配置
-        standardized_messages = self._standardize_cache_control(messages)
-
-        # 更新请求中的消息
-        standardized_request = request_data.copy()
-        standardized_request['messages'] = standardized_messages
+        # 标准化缓存策略：清理所有 cache_control（包括 system、messages 等），
+        # 只在最后一条消息添加标准配置
+        standardized_request = self._standardize_cache_control(request_data)
 
         logger.info("Stream request processed with standardized cache_control strategy")
 

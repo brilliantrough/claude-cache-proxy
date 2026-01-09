@@ -498,6 +498,7 @@ async def chat_completions_endpoint(request: Request):
 
         # 获取请求头
         headers = dict(request.headers)
+        logger.info(f"Header: {headers}")
 
         # 处理请求
         logger.info(f"Received {'stream' if is_stream else 'non-stream'} chat completion request")
