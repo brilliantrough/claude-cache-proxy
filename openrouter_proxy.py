@@ -90,6 +90,9 @@ class OpenAIRequestHandler:
         # 使用标准的 Authorization 头（大写 A，与 OpenRouter 官方示例一致）
         headers['Authorization'] = f'Bearer {self.api_key}'
         headers['Content-Type'] = 'application/json'
+        # 添加自定义header
+        headers['HTTP-Referer'] = 'https://api.pezayo.com'
+        headers['X-Title'] = 'One hub 站点'
         logger.info("Using configured default API key")
 
         return headers
