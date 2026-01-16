@@ -90,9 +90,9 @@ class OpenAIRequestHandler:
                     keepalive_timeout=30,
                     # 启用TCP缓冲区自动调整
                     enable_cleanup_closed=True,
-                    proxy=proxy_url,
                 )
             )
+            self.proxy_url = proxy_url  # 保存代理URL供请求使用
         return self.session
 
     def _prepare_headers(self, original_headers: Dict[str, str]) -> Dict[str, str]:
@@ -298,11 +298,15 @@ class OpenAIRequestHandler:
         logger.info(f"Forwarding request to: {url}")
 
         try:
-            async with session.post(
-                url,
-                json=request_data,
-                headers=prepared_headers
-            ) as response:
+            # 在请求级别设置代理
+            kwargs = {
+                "json": request_data,
+                "headers": prepared_headers
+            }
+            if hasattr(self, 'proxy_url') and self.proxy_url:
+                kwargs["proxy"] = self.proxy_url
+
+            async with session.post(url, **kwargs) as response:
                 response.raise_for_status()
 
                 response_data = await response.json()
@@ -329,15 +333,19 @@ class OpenAIRequestHandler:
         logger.info(f"Forwarding stream request to: {url}")
 
         try:
-            async with session.post(
-                url,
-                json=request_data,
-                headers=prepared_headers,
+            # 在请求级别设置代理
+            kwargs = {
+                "json": request_data,
+                "headers": prepared_headers,
                 # 增加流式响应的缓冲区大小
-                read_bufsize=8192,
+                "read_bufsize": 8192,
                 # 禁用自动解压缩，处理原始流
-                auto_decompress=False,
-            ) as response:
+                "auto_decompress": False,
+            }
+            if hasattr(self, 'proxy_url') and self.proxy_url:
+                kwargs["proxy"] = self.proxy_url
+
+            async with session.post(url, **kwargs) as response:
                 response.raise_for_status()
 
                 logger.info(f"Successfully connected to streaming endpoint")
