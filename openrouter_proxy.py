@@ -68,6 +68,17 @@ class OpenAIRequestHandler:
                 connect=60,  # 连接超时1分钟
                 sock_read=240  # 读取超时4分钟
             )
+
+            # 检查代理设置
+            proxy_url = (
+                os.environ.get('HTTPS_PROXY') or
+                os.environ.get('HTTP_PROXY') or
+                os.environ.get('ALL_PROXY')
+            )
+
+            if proxy_url:
+                logger.info(f"Using proxy: {proxy_url}")
+
             self.session = aiohttp.ClientSession(
                 timeout=timeout,
                 connector=aiohttp.TCPConnector(
@@ -79,6 +90,7 @@ class OpenAIRequestHandler:
                     keepalive_timeout=30,
                     # 启用TCP缓冲区自动调整
                     enable_cleanup_closed=True,
+                    proxy=proxy_url,
                 )
             )
         return self.session
