@@ -74,7 +74,7 @@ class AnthropicRequestHandler:
         headers['content-type'] = 'application/json'
 
         # 保留一些可能需要的客户端头部（可选）
-        optional_headers = ['anthropic-beta', 'user-agent']
+        optional_headers = ['anthropic-beta', 'user-agent', 'APP-Code']
         for header in optional_headers:
             if header in original_headers:
                 headers[header] = original_headers[header]
