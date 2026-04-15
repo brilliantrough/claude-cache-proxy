@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import uuid
 from typing import Optional, AsyncGenerator, Dict, Any
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +22,86 @@ logging.basicConfig(
     force=True  # 强制重新配置，覆盖现有配置
 )
 logger = logging.getLogger(__name__)
+
+
+def _summarize_content_block(content: Any) -> Dict[str, Any]:
+    """生成消息内容摘要，避免日志打印正文或 base64 数据"""
+    if isinstance(content, str):
+        return {
+            "content_type": "text",
+            "text_length": len(content)
+        }
+
+    if isinstance(content, list):
+        block_types = []
+        image_count = 0
+        text_blocks = 0
+        tool_use_blocks = 0
+        tool_result_blocks = 0
+
+        for block in content:
+            if not isinstance(block, dict):
+                block_types.append(type(block).__name__)
+                continue
+
+            block_type = block.get('type', 'unknown')
+            block_types.append(block_type)
+
+            if block_type == 'image':
+                image_count += 1
+            elif block_type == 'text':
+                text_blocks += 1
+            elif block_type == 'tool_use':
+                tool_use_blocks += 1
+            elif block_type == 'tool_result':
+                tool_result_blocks += 1
+
+        return {
+            "content_type": "blocks",
+            "block_count": len(content),
+            "block_types": block_types,
+            "image_count": image_count,
+            "text_blocks": text_blocks,
+            "tool_use_blocks": tool_use_blocks,
+            "tool_result_blocks": tool_result_blocks,
+        }
+
+    return {
+        "content_type": type(content).__name__
+    }
+
+
+def summarize_request_for_logging(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """生成安全的请求摘要，避免日志输出完整消息内容"""
+    summary = {
+        "model": request_data.get("model"),
+        "stream": request_data.get("stream", False),
+        "max_tokens": request_data.get("max_tokens"),
+        "temperature": request_data.get("temperature"),
+        "top_p": request_data.get("top_p"),
+        "tools_count": len(request_data.get("tools", [])) if isinstance(request_data.get("tools"), list) else None,
+        "system_count": len(request_data.get("system", [])) if isinstance(request_data.get("system"), list) else (1 if request_data.get("system") else 0),
+    }
+
+    messages = request_data.get("messages", [])
+    if isinstance(messages, list):
+        summary["messages_count"] = len(messages)
+        summary["message_roles"] = [message.get("role", "unknown") for message in messages if isinstance(message, dict)]
+
+        if messages and isinstance(messages[-1], dict):
+            summary["last_message"] = {
+                "role": messages[-1].get("role", "unknown"),
+                **_summarize_content_block(messages[-1].get("content"))
+            }
+
+    thinking = request_data.get("thinking")
+    if isinstance(thinking, dict):
+        summary["thinking"] = {
+            "type": thinking.get("type"),
+            "budget_tokens": thinking.get("budget_tokens")
+        }
+
+    return summary
 
 
 class AnthropicRequestHandler:
@@ -235,7 +316,8 @@ class AnthropicRequestHandler:
         return response_data
 
     async def handle_stream_request(self, request_data: Dict[str, Any],
-                                  headers: Optional[Dict[str, str]] = None) -> AsyncGenerator[bytes, None]:
+                                  headers: Optional[Dict[str, str]] = None,
+                                  request_id: Optional[str] = None) -> AsyncGenerator[bytes, None]:
         """处理流式 Anthropic API 请求"""
         headers = headers or {}
 
@@ -247,10 +329,11 @@ class AnthropicRequestHandler:
         # 只在最后一条消息添加标准配置
         standardized_request = self._standardize_cache_control(request_data)
 
-        logger.info("Stream request processed with standardized cache_control strategy")
+        log_prefix = f"[request_id={request_id}] " if request_id else ""
+        logger.info(f"{log_prefix}Stream request processed with standardized cache_control strategy")
 
         # 转发流式请求给 Anthropic API
-        async for chunk in self._forward_stream_to_anthropic(standardized_request, headers):
+        async for chunk in self._forward_stream_to_anthropic(standardized_request, headers, request_id=request_id):
             yield chunk
 
     async def handle_get_request(self, endpoint: str, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -316,15 +399,16 @@ class AnthropicRequestHandler:
             }
 
     async def _forward_stream_to_anthropic(self, request_data: Dict[str, Any],
-                                      headers: Optional[Dict[str, str]] = None) -> AsyncGenerator[bytes, None]:
+                                      headers: Optional[Dict[str, str]] = None,
+                                      request_id: Optional[str] = None) -> AsyncGenerator[bytes, None]:
         """转发流式请求到Anthropic API"""
         prepared_headers = self._prepare_headers(headers or {})
         session = await self._get_session()
         url = self.messages_endpoint
 
-        logger.info(f"Forwarding stream request to: {url}")
-        logger.info(f"Headers: {prepared_headers}")
-        logger.info(f"Request data: {request_data}")
+        log_prefix = f"[request_id={request_id}] " if request_id else ""
+        logger.info(f"{log_prefix}Forwarding stream request to: {url}")
+        logger.info(f"{log_prefix}Request summary: {json.dumps(summarize_request_for_logging(request_data), ensure_ascii=False)}")
 
 
         try:
@@ -339,17 +423,33 @@ class AnthropicRequestHandler:
             ) as response:
                 response.raise_for_status()
 
-                logger.info(f"Successfully connected to streaming endpoint")
+                logger.info(f"{log_prefix}Successfully connected to streaming endpoint")
 
                 # 使用更健壮的流式读取方法
                 try:
+                    chunk_count = 0
+                    total_bytes = 0
                     while True:
                         chunk = await response.content.read(8192)
                         if not chunk:
                             break
+                        chunk_count += 1
+                        total_bytes += len(chunk)
                         yield chunk
+                except asyncio.CancelledError:
+                    logger.warning(
+                        f"{log_prefix}Streaming response cancelled, likely client disconnected "
+                        f"after {chunk_count} chunks and {total_bytes} bytes"
+                    )
+                    raise
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    logger.warning(
+                        f"{log_prefix}Client connection dropped during streaming: {str(e)} "
+                        f"after {chunk_count} chunks and {total_bytes} bytes"
+                    )
+                    return
                 except (aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
-                    logger.error(f"Streaming interrupted: {str(e)}")
+                    logger.error(f"{log_prefix}Upstream streaming interrupted: {str(e)}")
                     # 发送SSE格式的错误信息
                     error_data = {
                         "error": {
@@ -361,10 +461,13 @@ class AnthropicRequestHandler:
                     yield error_chunk
                     return
 
-                logger.info(f"Streaming request completed successfully")
+                logger.info(
+                    f"{log_prefix}Streaming request completed successfully "
+                    f"with {chunk_count} chunks and {total_bytes} bytes"
+                )
 
         except asyncio.TimeoutError:
-            logger.error(f"Timeout error from Anthropic API: stream request timed out")
+            logger.error(f"{log_prefix}Timeout error from Anthropic API: stream request timed out")
             error_data = {
                 "error": {
                     "type": "timeout_error",
@@ -375,7 +478,7 @@ class AnthropicRequestHandler:
             yield error_chunk
 
         except aiohttp.ClientResponseError as e:
-            logger.error(f"HTTP error from Anthropic API: {e.status} - {str(e)}")
+            logger.error(f"{log_prefix}HTTP error from Anthropic API: {e.status} - {str(e)}")
             error_data = {
                 "error": {
                     "type": "api_error",
@@ -386,7 +489,7 @@ class AnthropicRequestHandler:
             yield error_chunk
 
         except aiohttp.ClientError as e:
-            logger.error(f"Request error: {str(e)}")
+            logger.error(f"{log_prefix}Upstream request error: {str(e)}")
             error_data = {
                 "error": {
                     "type": "network_error",
@@ -396,8 +499,16 @@ class AnthropicRequestHandler:
             error_chunk = f'event: error\ndata: {json.dumps(error_data)}\n\n'.encode('utf-8')
             yield error_chunk
 
+        except asyncio.CancelledError:
+            logger.warning(f"{log_prefix}Streaming request cancelled before completion")
+            raise
+
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.warning(f"{log_prefix}Client connection dropped before stream completed: {str(e)}")
+            return
+
         except Exception as e:
-            logger.error(f"Unexpected error during streaming: {str(e)}")
+            logger.error(f"{log_prefix}Unexpected error during streaming: {str(e)}")
             error_data = {
                 "error": {
                     "type": "unknown_error",
@@ -615,6 +726,7 @@ async def messages_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Content-Type must be application/json")
 
         request_data = await request.json()
+        request_id = request.headers.get('x-request-id') or str(uuid.uuid4())[:8]
 
         # 检查是否为流式请求
         is_stream = request_data.get('stream', False)
@@ -641,25 +753,29 @@ async def messages_endpoint(request: Request):
         headers = dict(request.headers)
 
         # 处理请求
-        logger.info(f"Received {'stream' if is_stream else 'non-stream'} request")
-        logger.info(f"Request data: {json.dumps({k: v for k, v in request_data.items() if k != 'messages'}, ensure_ascii=False)}")
+        logger.info(f"[request_id={request_id}] Received {'stream' if is_stream else 'non-stream'} request")
+        logger.info(
+            f"[request_id={request_id}] Request summary: "
+            f"{json.dumps(summarize_request_for_logging(request_data), ensure_ascii=False)}"
+        )
 
         if is_stream:
             # 流式回复
-            logger.info("Processing as streaming request")
+            logger.info(f"[request_id={request_id}] Processing as streaming request")
             return StreamingResponse(
-                request_handler.handle_stream_request(request_data, headers),
+                request_handler.handle_stream_request(request_data, headers, request_id=request_id),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Allow-Headers": "*",
+                    "X-Request-Id": request_id,
                 }
             )
         else:
             # 非流式回复
-            logger.info("Processing as non-streaming request")
+            logger.info(f"[request_id={request_id}] Processing as non-streaming request")
             response_data = await request_handler.handle_request(request_data, headers)
 
             # 检查是否是错误响应
@@ -676,11 +792,11 @@ async def messages_endpoint(request: Request):
                 elif error_type == 'json_decode_error':
                     status_code = 502
 
-                logger.warning(f"Request failed: {response_data}")
+                logger.warning(f"[request_id={request_id}] Request failed: {response_data}")
                 return JSONResponse(status_code=status_code, content=response_data)
 
-            logger.info("Request completed successfully")
-            return JSONResponse(content=response_data)
+            logger.info(f"[request_id={request_id}] Request completed successfully")
+            return JSONResponse(content=response_data, headers={"X-Request-Id": request_id})
 
     except json.JSONDecodeError:
         logger.error("Invalid JSON in request body")
