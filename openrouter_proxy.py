@@ -2,6 +2,7 @@ import os
 import json
 import logging
 import asyncio
+import uuid
 from typing import Optional, Dict, Any, AsyncGenerator
 from fastapi import FastAPI, Request, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +21,83 @@ logging.basicConfig(
     force=True
 )
 logger = logging.getLogger(__name__)
+
+
+def _summarize_content(content: Any) -> Dict[str, Any]:
+    """生成消息内容摘要，避免日志打印正文或 base64 数据"""
+    if isinstance(content, str):
+        return {
+            "content_type": "text",
+            "text_length": len(content)
+        }
+
+    if isinstance(content, list):
+        block_types = []
+        image_count = 0
+        text_blocks = 0
+
+        for block in content:
+            if not isinstance(block, dict):
+                block_types.append(type(block).__name__)
+                continue
+
+            block_type = block.get('type', 'unknown')
+            block_types.append(block_type)
+            if block_type in ('image', 'image_url'):
+                image_count += 1
+            elif block_type == 'text':
+                text_blocks += 1
+
+        return {
+            "content_type": "blocks",
+            "block_count": len(content),
+            "block_types": block_types,
+            "image_count": image_count,
+            "text_blocks": text_blocks,
+        }
+
+    return {
+        "content_type": type(content).__name__
+    }
+
+
+def summarize_request_for_logging(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    """生成安全的请求摘要，避免日志输出完整消息内容"""
+    summary = {
+        "model": request_data.get("model"),
+        "stream": request_data.get("stream", False),
+        "max_tokens": request_data.get("max_tokens"),
+        "temperature": request_data.get("temperature"),
+        "top_p": request_data.get("top_p"),
+        "tools_count": len(request_data.get("tools", [])) if isinstance(request_data.get("tools"), list) else None,
+    }
+
+    messages = request_data.get("messages", [])
+    if isinstance(messages, list):
+        summary["messages_count"] = len(messages)
+        summary["message_roles"] = [message.get("role", "unknown") for message in messages if isinstance(message, dict)]
+
+        if messages and isinstance(messages[-1], dict):
+            summary["last_message"] = {
+                "role": messages[-1].get("role", "unknown"),
+                **_summarize_content(messages[-1].get("content"))
+            }
+
+    thinking = request_data.get("thinking")
+    if isinstance(thinking, dict):
+        summary["thinking"] = {
+            "type": thinking.get("type"),
+            "budget_tokens": thinking.get("budget_tokens")
+        }
+
+    reasoning = request_data.get("reasoning")
+    if isinstance(reasoning, dict):
+        summary["reasoning"] = {
+            "enabled": reasoning.get("enabled"),
+            "max_tokens": reasoning.get("max_tokens")
+        }
+
+    return summary
 
 # 创建FastAPI应用
 app = FastAPI(
@@ -232,7 +310,8 @@ class OpenAIRequestHandler:
         return response_data
 
     async def handle_stream_request(self, request_data: Dict[str, Any],
-                                  headers: Optional[Dict[str, str]] = None) -> AsyncGenerator[bytes, None]:
+                                  headers: Optional[Dict[str, str]] = None,
+                                  request_id: Optional[str] = None) -> AsyncGenerator[bytes, None]:
         """处理流式 OpenAI API 请求"""
         headers = headers or {}
 
@@ -253,10 +332,11 @@ class OpenAIRequestHandler:
         claude_reasoning = cached_request.get("thinking", {"type": "disabled", "budget_tokens": 3276})
         cached_request['reasoning'] = {"enabled": claude_reasoning['type'] == "enabled", "max_tokens": claude_reasoning['budget_tokens']}
 
-        logger.info("Stream request processed with OpenRouter cache_control strategy")
+        log_prefix = f"[request_id={request_id}] " if request_id else ""
+        logger.info(f"{log_prefix}Stream request processed with OpenRouter cache_control strategy")
 
         # 转发流式请求给目标API
-        async for chunk in self._forward_stream_to_api(cached_request, headers):
+        async for chunk in self._forward_stream_to_api(cached_request, headers, request_id=request_id):
             yield chunk
 
     async def handle_models_request(self, headers: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
@@ -323,14 +403,16 @@ class OpenAIRequestHandler:
             }
 
     async def _forward_stream_to_api(self, request_data: Dict[str, Any],
-                                    headers: Optional[Dict[str, str]] = None) -> AsyncGenerator[bytes, None]:
+                                    headers: Optional[Dict[str, str]] = None,
+                                    request_id: Optional[str] = None) -> AsyncGenerator[bytes, None]:
         """转发流式请求到目标API"""
         prepared_headers = self._prepare_headers(headers or {})
-        logger.info(f"{prepared_headers}")
         session = await self._get_session()
         url = self.chat_endpoint
 
-        logger.info(f"Forwarding stream request to: {url}")
+        log_prefix = f"[request_id={request_id}] " if request_id else ""
+        logger.info(f"{log_prefix}Forwarding stream request to: {url}")
+        logger.info(f"{log_prefix}Request summary: {json.dumps(summarize_request_for_logging(request_data), ensure_ascii=False)}")
 
         try:
             # 在请求级别设置代理
@@ -348,17 +430,33 @@ class OpenAIRequestHandler:
             async with session.post(url, **kwargs) as response:
                 response.raise_for_status()
 
-                logger.info(f"Successfully connected to streaming endpoint")
+                logger.info(f"{log_prefix}Successfully connected to streaming endpoint")
 
                 # 使用更健壮的流式读取方法
                 try:
+                    chunk_count = 0
+                    total_bytes = 0
                     while True:
                         chunk = await response.content.read(8192)
                         if not chunk:
                             break
+                        chunk_count += 1
+                        total_bytes += len(chunk)
                         yield chunk
+                except asyncio.CancelledError:
+                    logger.warning(
+                        f"{log_prefix}Streaming response cancelled, likely client disconnected "
+                        f"after {chunk_count} chunks and {total_bytes} bytes"
+                    )
+                    raise
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    logger.warning(
+                        f"{log_prefix}Client connection dropped during streaming: {str(e)} "
+                        f"after {chunk_count} chunks and {total_bytes} bytes"
+                    )
+                    return
                 except (aiohttp.ClientPayloadError, asyncio.TimeoutError) as e:
-                    logger.error(f"Streaming interrupted: {str(e)}")
+                    logger.error(f"{log_prefix}Upstream streaming interrupted: {str(e)}")
                     # 发送SSE格式的错误信息
                     error_data = {
                         "error": {
@@ -370,10 +468,13 @@ class OpenAIRequestHandler:
                     yield error_chunk
                     return
 
-                logger.info(f"Streaming request completed successfully")
+                logger.info(
+                    f"{log_prefix}Streaming request completed successfully "
+                    f"with {chunk_count} chunks and {total_bytes} bytes"
+                )
 
         except aiohttp.ClientResponseError as e:
-            logger.error(f"HTTP error during streaming: {e.status} - {e.message}")
+            logger.error(f"{log_prefix}HTTP error during streaming: {e.status} - {e.message}")
             # 发送HTTP错误信息
             error_data = {
                 "error": {
@@ -385,7 +486,7 @@ class OpenAIRequestHandler:
             yield error_chunk
 
         except (asyncio.TimeoutError, aiohttp.ServerTimeoutError) as e:
-            logger.error(f"Timeout during streaming: {str(e)}")
+            logger.error(f"{log_prefix}Timeout during streaming: {str(e)}")
             # 发送超时错误信息
             error_data = {
                 "error": {
@@ -396,8 +497,16 @@ class OpenAIRequestHandler:
             error_chunk = f'data: {json.dumps(error_data)}\n\n'.encode('utf-8')
             yield error_chunk
 
+        except asyncio.CancelledError:
+            logger.warning(f"{log_prefix}Streaming request cancelled before completion")
+            raise
+
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.warning(f"{log_prefix}Client connection dropped before stream completed: {str(e)}")
+            return
+
         except Exception as e:
-            logger.error(f"Stream request error: {str(e)}")
+            logger.error(f"{log_prefix}Stream request error: {str(e)}")
             # 发送通用错误信息
             error_data = {
                 "error": {
@@ -513,45 +622,47 @@ async def chat_completions_endpoint(request: Request):
             raise HTTPException(status_code=400, detail="Content-Type must be application/json")
 
         request_data = await request.json()
+        request_id = request.headers.get('x-request-id') or str(uuid.uuid4())[:8]
 
         # 检查是否为流式请求
         is_stream = request_data.get('stream', False)
 
-        logger.info(f"is_stream {is_stream}")
-
         # 获取请求头
         headers = dict(request.headers)
-        logger.info(f"Header: {headers}")
 
         # 处理请求
-        logger.info(f"Received {'stream' if is_stream else 'non-stream'} chat completion request")
-        logger.info(f"Request data: {json.dumps({k: v for k, v in request_data.items() if k != 'messages'}, ensure_ascii=False)}")
+        logger.info(f"[request_id={request_id}] Received {'stream' if is_stream else 'non-stream'} chat completion request")
+        logger.info(
+            f"[request_id={request_id}] Request summary: "
+            f"{json.dumps(summarize_request_for_logging(request_data), ensure_ascii=False)}"
+        )
 
         if is_stream:
             # 流式回复
-            logger.info("Processing as streaming request")
+            logger.info(f"[request_id={request_id}] Processing as streaming request")
             return StreamingResponse(
-                request_handler.handle_stream_request(request_data, headers),
+                request_handler.handle_stream_request(request_data, headers, request_id=request_id),
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache",
                     "Connection": "keep-alive",
                     "Access-Control-Allow-Origin": "*",
                     "Access-Control-Allow-Headers": "*",
+                    "X-Request-Id": request_id,
                 }
             )
         else:
             # 非流式回复
-            logger.info("Processing as non-streaming request")
+            logger.info(f"[request_id={request_id}] Processing as non-streaming request")
             response_data = await request_handler.handle_request(request_data, headers)
 
             # 检查是否是错误响应
             if 'error' in response_data:
-                logger.warning(f"Request failed: {response_data}")
+                logger.warning(f"[request_id={request_id}] Request failed: {response_data}")
                 return JSONResponse(status_code=500, content=response_data)
 
-            logger.info("Request completed successfully")
-            return JSONResponse(content=response_data)
+            logger.info(f"[request_id={request_id}] Request completed successfully")
+            return JSONResponse(content=response_data, headers={"X-Request-Id": request_id})
 
     except json.JSONDecodeError:
         logger.error("Invalid JSON in request body")
