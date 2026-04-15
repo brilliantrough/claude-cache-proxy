@@ -23,6 +23,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+DEFAULT_OPENROUTER_MODEL_MAP = {
+    "claude-opus-4-6": "anthropic/claude-opus-4.6",
+    "claude-opus-latest": "anthropic/claude-opus-4.6",
+    "claude-sonnet-latest": "anthropic/claude-sonnet-4.6",
+    "claude-sonnet-4-5-20250929": "anthropic/claude-sonnet-4.5",
+    "claude-opus-4-5-20251101": "anthropic/claude-opus-4.5",
+    "claude-sonnet-4-20250514": "anthropic/claude-sonnet-4",
+    "claude-opus-4-1-20250805": "anthropic/claude-opus-4.1",
+}
+
+
 def _summarize_content(content: Any) -> Dict[str, Any]:
     """生成消息内容摘要，避免日志打印正文或 base64 数据"""
     if isinstance(content, str):
@@ -64,6 +75,7 @@ def _summarize_content(content: Any) -> Dict[str, Any]:
 def summarize_request_for_logging(request_data: Dict[str, Any]) -> Dict[str, Any]:
     """生成安全的请求摘要，避免日志输出完整消息内容"""
     summary = {
+        "original_model": request_data.get("original_model", request_data.get("model")),
         "model": request_data.get("model"),
         "stream": request_data.get("stream", False),
         "max_tokens": request_data.get("max_tokens"),
@@ -99,6 +111,32 @@ def summarize_request_for_logging(request_data: Dict[str, Any]) -> Dict[str, Any
 
     return summary
 
+
+def load_model_map_from_env() -> Dict[str, str]:
+    """从环境变量加载模型映射，并与默认映射合并"""
+    model_map = DEFAULT_OPENROUTER_MODEL_MAP.copy()
+    raw_model_map = os.getenv("OPENROUTER_MODEL_MAP_JSON")
+
+    if not raw_model_map:
+        return model_map
+
+    try:
+        custom_model_map = json.loads(raw_model_map)
+        if not isinstance(custom_model_map, dict):
+            logger.warning("OPENROUTER_MODEL_MAP_JSON must be a JSON object, ignoring custom mapping")
+            return model_map
+
+        normalized_custom_map = {
+            str(alias).strip(): str(target).strip()
+            for alias, target in custom_model_map.items()
+            if str(alias).strip() and str(target).strip()
+        }
+        model_map.update(normalized_custom_map)
+    except json.JSONDecodeError as error:
+        logger.warning(f"Failed to parse OPENROUTER_MODEL_MAP_JSON: {error}")
+
+    return model_map
+
 # 创建FastAPI应用
 app = FastAPI(
     title="OpenAI Format Proxy",
@@ -126,6 +164,9 @@ class OpenAIRequestHandler:
         self.api_url = api_url.rstrip('/')
         self.api_key = api_key
         self.session: Optional[aiohttp.ClientSession] = None
+        self.model_map = load_model_map_from_env()
+        self.default_reasoning_budget = int(os.getenv('OPENROUTER_REASONING_BUDGET', '30000'))
+        self.default_thinking_max_tokens = int(os.getenv('OPENROUTER_THINKING_MAX_TOKENS', '80000'))
 
         # 确保 API URL 以 /v1 结尾，如果不是则添加
         if not self.api_url.endswith('/v1'):
@@ -136,6 +177,42 @@ class OpenAIRequestHandler:
 
         logger.info(f"Initialized OpenAI Request Handler with cache_control support")
         logger.info(f"Target API URL: {self.api_url}")
+
+    def _normalize_model_and_reasoning(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
+        """标准化模型名，并根据 -thinking 后缀启用 reasoning"""
+        normalized_request = request_data.copy()
+
+        original_model = normalized_request.get('model', '')
+        if not isinstance(original_model, str) or not original_model.strip():
+            return normalized_request
+
+        model_name = original_model.strip()
+        thinking_enabled_by_suffix = False
+
+        if model_name.endswith('-thinking'):
+            model_name = model_name[:-len('-thinking')]
+            thinking_enabled_by_suffix = True
+
+        resolved_model = self.model_map.get(model_name, model_name)
+        normalized_request['original_model'] = original_model
+        normalized_request['model'] = resolved_model
+
+        if thinking_enabled_by_suffix:
+            existing_thinking = normalized_request.get('thinking', {})
+            budget_tokens = self.default_reasoning_budget
+            if isinstance(existing_thinking, dict) and isinstance(existing_thinking.get('budget_tokens'), int):
+                budget_tokens = existing_thinking['budget_tokens']
+
+            normalized_request['thinking'] = {
+                'type': 'enabled',
+                'budget_tokens': budget_tokens
+            }
+
+            max_tokens = normalized_request.get('max_tokens')
+            if not isinstance(max_tokens, int) or max_tokens < self.default_thinking_max_tokens:
+                normalized_request['max_tokens'] = self.default_thinking_max_tokens
+
+        return normalized_request
 
     async def _get_session(self) -> aiohttp.ClientSession:
         """获取或创建 aiohttp 会话"""
@@ -294,14 +371,22 @@ class OpenAIRequestHandler:
         if not self._validate_openai_request(request_data):
             raise ValueError("Invalid OpenAI request format")
 
-        messages = request_data.get('messages', [])
+        normalized_request = self._normalize_model_and_reasoning(request_data)
+        messages = normalized_request.get('messages', [])
 
         # 添加 cache_control 到最后一条消息
         cached_messages = self._add_cache_control_to_messages(messages)
 
         # 更新请求中的消息
-        cached_request = request_data.copy()
+        cached_request = normalized_request.copy()
         cached_request['messages'] = cached_messages
+
+        # 转换 thinking 字段为 reasoning 字段（OpenRouter 格式）
+        claude_reasoning = cached_request.get("thinking", {"type": "disabled", "budget_tokens": self.default_reasoning_budget})
+        cached_request['reasoning'] = {
+            "enabled": claude_reasoning.get('type') == "enabled",
+            "max_tokens": claude_reasoning.get('budget_tokens', self.default_reasoning_budget)
+        }
 
         logger.info("Request processed with OpenRouter cache_control strategy")
 
@@ -319,18 +404,22 @@ class OpenAIRequestHandler:
         if not self._validate_openai_request(request_data):
             raise ValueError("Invalid OpenAI request format")
 
-        messages = request_data.get('messages', [])
+        normalized_request = self._normalize_model_and_reasoning(request_data)
+        messages = normalized_request.get('messages', [])
 
         # 添加 cache_control 到最后一条消息
         cached_messages = self._add_cache_control_to_messages(messages)
 
         # 更新请求中的消息
-        cached_request = request_data.copy()
+        cached_request = normalized_request.copy()
         cached_request['messages'] = cached_messages
 
         # 转换 thinking 字段为 reasoning 字段（OpenRouter 格式）
-        claude_reasoning = cached_request.get("thinking", {"type": "disabled", "budget_tokens": 3276})
-        cached_request['reasoning'] = {"enabled": claude_reasoning['type'] == "enabled", "max_tokens": claude_reasoning['budget_tokens']}
+        claude_reasoning = cached_request.get("thinking", {"type": "disabled", "budget_tokens": self.default_reasoning_budget})
+        cached_request['reasoning'] = {
+            "enabled": claude_reasoning.get('type') == "enabled",
+            "max_tokens": claude_reasoning.get('budget_tokens', self.default_reasoning_budget)
+        }
 
         log_prefix = f"[request_id={request_id}] " if request_id else ""
         logger.info(f"{log_prefix}Stream request processed with OpenRouter cache_control strategy")
