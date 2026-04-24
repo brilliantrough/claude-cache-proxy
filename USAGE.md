@@ -58,6 +58,60 @@ response = requests.post(
 )
 ```
 
+OpenRouter 代理支持后端模型别名映射和 `-thinking` 后缀兼容。模型别名优先维护在 `openrouter_model_map.json`，后续新增模型通常只需要修改这个 JSON 文件并重启代理。
+
+可直接传入别名模型：
+
+```python
+response = requests.post(
+    "http://localhost:9998/v1/chat/completions",
+    headers={"Authorization": "Bearer your-api-key"},
+    json={
+        "model": "claude-opus-4-6",
+        "messages": [{"role": "user", "content": "Hello!"}],
+        "max_tokens": 100
+    }
+)
+```
+
+也可在模型名后添加 `-thinking` 启用思考模式：
+
+```python
+response = requests.post(
+    "http://localhost:9998/v1/chat/completions",
+    headers={"Authorization": "Bearer your-api-key"},
+    json={
+        "model": "claude-opus-4-6-thinking",
+        "messages": [{"role": "user", "content": "请先思考再回答"}]
+    }
+)
+```
+
+默认规则：
+
+- `claude-opus-4-6` 会自动映射为 `anthropic/claude-opus-4.6`
+- `claude-opus-4-6-thinking` 会自动映射并开启 reasoning
+- `claude-opus-4-7` 可在 `openrouter_model_map.json` 中映射为 `anthropic/claude-opus-4.7`
+- `claude-opus-4-7-thinking` 会先去掉 `-thinking`，再使用同一个 JSON 映射并开启 reasoning
+- `OPENROUTER_REASONING_BUDGET` 默认值为 `30000`
+- `OPENROUTER_THINKING_MAX_TOKENS` 默认值为 `80000`
+- 当启用 `-thinking` 时，如果 `max_tokens` 小于 `80000`，代理会自动提升到 `80000`
+
+模型映射加载优先级：
+
+1. 代码内置默认映射
+2. `OPENROUTER_MODEL_MAP_FILE` 指向的 JSON 文件，默认是 `openrouter_model_map.json`
+3. `.env` 里的 `OPENROUTER_MODEL_MAP_JSON`，用于临时覆盖
+
+`openrouter_model_map.json` 示例：
+
+```json
+{
+  "claude-opus-4-7": "anthropic/claude-opus-4.7",
+  "claude-opus-latest": "anthropic/claude-opus-4.7"
+}
+```
+
 ## 🧪 测试验证
 
 ```bash
@@ -91,4 +145,8 @@ PROXY_PORT=9999
 # OpenRouter
 OPENROUTER_API_KEY=your-key
 OPENAI_PROXY_PORT=9998
+OPENROUTER_MODEL_MAP_FILE=openrouter_model_map.json
+OPENROUTER_REASONING_BUDGET=30000
+OPENROUTER_THINKING_MAX_TOKENS=80000
+OPENROUTER_MODEL_MAP_JSON={"claude-opus-4-7":"anthropic/claude-opus-4.7"}
 ```

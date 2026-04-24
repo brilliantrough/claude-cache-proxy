@@ -33,6 +33,8 @@ DEFAULT_OPENROUTER_MODEL_MAP = {
     "claude-opus-4-1-20250805": "anthropic/claude-opus-4.1",
 }
 
+DEFAULT_OPENROUTER_MODEL_MAP_FILE = "openrouter_model_map.json"
+
 
 def _summarize_content(content: Any) -> Dict[str, Any]:
     """生成消息内容摘要，避免日志打印正文或 base64 数据"""
@@ -112,9 +114,35 @@ def summarize_request_for_logging(request_data: Dict[str, Any]) -> Dict[str, Any
     return summary
 
 
+def _normalize_model_map(raw_model_map: Any, source: str) -> Dict[str, str]:
+    """标准化模型映射配置，忽略空 key/value"""
+    if not isinstance(raw_model_map, dict):
+        logger.warning(f"{source} must be a JSON object, ignoring mapping")
+        return {}
+
+    return {
+        str(alias).strip(): str(target).strip()
+        for alias, target in raw_model_map.items()
+        if str(alias).strip() and str(target).strip()
+    }
+
+
 def load_model_map_from_env() -> Dict[str, str]:
-    """从环境变量加载模型映射，并与默认映射合并"""
+    """加载模型映射：默认值 < JSON 文件 < 环境变量"""
     model_map = DEFAULT_OPENROUTER_MODEL_MAP.copy()
+
+    model_map_file = os.getenv("OPENROUTER_MODEL_MAP_FILE", DEFAULT_OPENROUTER_MODEL_MAP_FILE)
+    if model_map_file and os.path.exists(model_map_file):
+        try:
+            with open(model_map_file, "r", encoding="utf-8") as file:
+                file_model_map = json.load(file)
+            model_map.update(_normalize_model_map(file_model_map, model_map_file))
+            logger.info(f"Loaded OpenRouter model map from {model_map_file}")
+        except json.JSONDecodeError as error:
+            logger.warning(f"Failed to parse {model_map_file}: {error}")
+        except OSError as error:
+            logger.warning(f"Failed to read {model_map_file}: {error}")
+
     raw_model_map = os.getenv("OPENROUTER_MODEL_MAP_JSON")
 
     if not raw_model_map:
@@ -122,16 +150,7 @@ def load_model_map_from_env() -> Dict[str, str]:
 
     try:
         custom_model_map = json.loads(raw_model_map)
-        if not isinstance(custom_model_map, dict):
-            logger.warning("OPENROUTER_MODEL_MAP_JSON must be a JSON object, ignoring custom mapping")
-            return model_map
-
-        normalized_custom_map = {
-            str(alias).strip(): str(target).strip()
-            for alias, target in custom_model_map.items()
-            if str(alias).strip() and str(target).strip()
-        }
-        model_map.update(normalized_custom_map)
+        model_map.update(_normalize_model_map(custom_model_map, "OPENROUTER_MODEL_MAP_JSON"))
     except json.JSONDecodeError as error:
         logger.warning(f"Failed to parse OPENROUTER_MODEL_MAP_JSON: {error}")
 
