@@ -4,7 +4,7 @@ import logging
 import asyncio
 import uuid
 from typing import Optional, AsyncGenerator, Dict, Any
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
@@ -104,6 +104,40 @@ def summarize_request_for_logging(request_data: Dict[str, Any]) -> Dict[str, Any
     return summary
 
 
+def _read_int_env(name: str, default: int) -> int:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+
+    try:
+        return int(raw_value)
+    except ValueError:
+        logger.warning(f"Invalid {name} '{raw_value}', using default {default}")
+        return default
+
+
+def normalize_anthropic_model_and_thinking(request_data: Dict[str, Any]) -> Dict[str, Any]:
+    normalized_request = request_data.copy()
+    model_name = normalized_request.get('model', '')
+
+    if not isinstance(model_name, str) or not model_name.endswith('-thinking'):
+        return normalized_request
+
+    base_model = model_name[:-len('-thinking')]
+    thinking_budget = _read_int_env('ANTHROPIC_THINKING_BUDGET_TOKENS', 8192)
+    thinking_max_tokens = _read_int_env('ANTHROPIC_THINKING_MAX_TOKENS', 16384)
+
+    normalized_request['model'] = base_model
+    normalized_request['thinking'] = {
+        "type": "enabled",
+        "budget_tokens": thinking_budget
+    }
+    normalized_request['max_tokens'] = thinking_max_tokens
+
+    logger.info(f"Processed thinking model: {model_name} -> {base_model} with thinking enabled")
+    return normalized_request
+
+
 class AnthropicRequestHandler:
     """Anthropic API 请求处理器，负责转发请求"""
 
@@ -162,28 +196,17 @@ class AnthropicRequestHandler:
 
         return headers
 
-    def _remove_cache_control_recursive(self, data) -> None:
-        """递归地从数据结构中移除所有 cache_control 字段
-
-        处理的数据结构类型：
-        - dict: 移除 cache_control 键，并递归处理所有值
-        - list: 递归处理所有元素
-        - 其他: 忽略
-
-        注意：此函数直接修改传入的数据（in-place）
-        """
+    def _remove_cache_control_recursive(self, data):
+        """递归返回移除 cache_control 后的新数据结构"""
         if isinstance(data, dict):
-            # 移除当前字典级别的 cache_control
-            if 'cache_control' in data:
-                del data['cache_control']
-            # 递归处理所有值
-            for value in data.values():
-                self._remove_cache_control_recursive(value)
-        elif isinstance(data, list):
-            # 递归处理列表中的每个元素
-            for item in data:
-                self._remove_cache_control_recursive(item)
-        # 其他类型（str, int, bool, None等）忽略
+            return {
+                key: self._remove_cache_control_recursive(value)
+                for key, value in data.items()
+                if key != 'cache_control'
+            }
+        if isinstance(data, list):
+            return [self._remove_cache_control_recursive(item) for item in data]
+        return data
 
     def _standardize_cache_control(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
         """标准化请求中的 cache_control 策略
@@ -199,11 +222,8 @@ class AnthropicRequestHandler:
         """
         logger.info(f"Original request keys: {request_data.keys()}")
 
-        # 创建请求的深拷贝，避免修改原始数据
-        standardized_request = request_data.copy()
-
         # 第一步：递归删除所有位置的 cache_control
-        self._remove_cache_control_recursive(standardized_request)
+        standardized_request = self._remove_cache_control_recursive(request_data)
 
         # 第二步：在 messages 的最后一条消息添加 cache_control
         messages = standardized_request.get('messages', [])
@@ -734,20 +754,7 @@ async def messages_endpoint(request: Request):
         request_data.pop("temperature", None)
 
         # 预处理模型名称：处理-thinking结尾的模型
-        model_name = request_data.get('model', '')
-        if model_name.endswith('-thinking'):
-            # 去掉"-thinking"后缀
-            base_model = model_name[:-len('-thinking')]
-            request_data['model'] = base_model
-
-            # 添加thinking参数
-            request_data['thinking'] = {
-                "type": "enabled",
-                "budget_tokens": 8192
-            }
-            request_data['max_tokens'] = 16384
-
-            logger.info(f"Processed thinking model: {model_name} -> {base_model} with thinking enabled")
+        request_data = normalize_anthropic_model_and_thinking(request_data)
 
         # 获取请求头
         headers = dict(request.headers)

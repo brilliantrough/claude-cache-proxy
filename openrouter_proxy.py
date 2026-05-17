@@ -4,7 +4,7 @@ import logging
 import asyncio
 import uuid
 from typing import Optional, Dict, Any, AsyncGenerator
-from fastapi import FastAPI, Request, Response, HTTPException
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn

@@ -76,12 +76,28 @@ def test_thinking_alias_uses_file_mapping() -> bool:
             and normalized["max_tokens"] == 80000
         )
 
+def test_unknown_model_passthrough() -> bool:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        config_path = Path(tmpdir) / "openrouter_model_map.json"
+        config_path.write_text("{}", encoding="utf-8")
+        openrouter_proxy = reload_openrouter_proxy(config_path)
+
+        handler = openrouter_proxy.OpenAIRequestHandler("https://openrouter.ai/api", "test-key")
+        request_data = {
+            "model": "unknown-provider/model",
+            "messages": [{"role": "user", "content": "Hello"}],
+        }
+        normalized = handler._normalize_model_and_reasoning(request_data)
+
+        return normalized["model"] == "unknown-provider/model" and "thinking" not in normalized
+
 
 def main() -> bool:
     tests = [
         ("JSON 文件映射加载", test_load_model_map_from_json_file),
         ("环境变量覆盖 JSON 文件", test_env_mapping_overrides_file_mapping),
         ("thinking 别名使用 JSON 映射", test_thinking_alias_uses_file_mapping),
+        ("未知模型透传", test_unknown_model_passthrough),
     ]
 
     passed = 0

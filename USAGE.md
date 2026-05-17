@@ -43,6 +43,13 @@ response = client.messages.create(
 )
 ```
 
+Anthropic 代理会清理请求里已有的 `cache_control`，并只在最后一条消息的最后一个内容块添加统一的 `cache_control`。如果模型名以 `-thinking` 结尾，代理会去掉该后缀并启用 thinking；未知模型名默认原样透传。
+
+可通过环境变量调整 Anthropic thinking 默认值：
+
+- `ANTHROPIC_THINKING_BUDGET_TOKENS` 默认值为 `8192`
+- `ANTHROPIC_THINKING_MAX_TOKENS` 默认值为 `16384`
+
 #### OpenRouter 代理 (localhost:9998)
 ```python
 import requests
@@ -141,6 +148,8 @@ python tests/openrouter/test_openrouter_core_endpoints.py
 # Anthropic
 ANTHROPIC_API_KEY=your-key
 PROXY_PORT=9999
+ANTHROPIC_THINKING_BUDGET_TOKENS=8192
+ANTHROPIC_THINKING_MAX_TOKENS=16384
 
 # OpenRouter
 OPENROUTER_API_KEY=your-key

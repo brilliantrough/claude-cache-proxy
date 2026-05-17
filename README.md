@@ -77,7 +77,7 @@ claude_proxy/
 ├── anthropic_proxy.py     # Anthropic 代理服务器
 ├── openrouter_proxy.py    # OpenRouter 代理服务器
 ├── tests/                 # 测试目录
-│   ├── anthropropic/       # Anthropic 测试
+│   ├── anthropic/        # Anthropic 测试
 │   └── openrouter/        # OpenRouter 测试
 ├── pyproject.toml         # 项目配置
 └── README.md              # 项目文档
