@@ -371,6 +371,10 @@ class AnthropicRequestHandler:
 
         try:
             async with session.get(url, headers=prepared_headers) as response:
+                # 与 POST 路径一致：在上下文内检查状态并读取上游错误体
+                if response.status >= 400:
+                    return await self._build_error_response(response)
+
                 if response.headers.get('content-type', '').startswith('application/json'):
                     return await response.json()
                 else:
@@ -384,21 +388,6 @@ class AnthropicRequestHandler:
                     "message": "Request to Anthropic API timed out after 120 seconds"
                 }
             }
-
-        except aiohttp.ClientResponseError as e:
-            logger.error(f"HTTP error from Anthropic API: {e.status} - {await e.text()}")
-            error_response = {
-                "error": {
-                    "type": "api_error",
-                    "message": f"Anthropic API returned status {e.status}"
-                }
-            }
-            if e.headers.get('content-type', '').startswith('application/json'):
-                try:
-                    error_response = await e.json()
-                except:
-                    pass
-            return error_response
 
         except aiohttp.ClientError as e:
             logger.error(f"Request error: {str(e)}")
@@ -441,7 +430,33 @@ class AnthropicRequestHandler:
                 # 禁用自动解压缩，处理原始流
                 auto_decompress=False,
             ) as response:
-                response.raise_for_status()
+                # 上游返回错误状态时，在上下文内读取错误体并以 SSE 形式回传，
+                # 而不是依赖 raise_for_status()（其异常对象不携带 body）。
+                if response.status >= 400:
+                    try:
+                        body_text = await response.text()
+                    except Exception as read_err:
+                        body_text = f"<failed to read upstream body: {read_err}>"
+                    logger.error(
+                        f"{log_prefix}HTTP error from upstream API: {response.status} - {body_text}"
+                    )
+
+                    error_payload = None
+                    if response.headers.get('content-type', '').startswith('application/json'):
+                        try:
+                            error_payload = json.loads(body_text)
+                        except (json.JSONDecodeError, ValueError):
+                            error_payload = None
+                    if error_payload is None:
+                        error_payload = {
+                            "error": {
+                                "type": "api_error",
+                                "message": f"Upstream API returned status {response.status}: {body_text}"
+                            }
+                        }
+                    error_chunk = f'event: error\ndata: {json.dumps(error_payload)}\n\n'.encode('utf-8')
+                    yield error_chunk
+                    return
 
                 logger.info(f"{log_prefix}Successfully connected to streaming endpoint")
 
@@ -553,7 +568,12 @@ class AnthropicRequestHandler:
                 json=request_data,
                 headers=prepared_headers
             ) as response:
-                response.raise_for_status()
+                # 注意：必须在 async with 块内读取响应体。
+                # aiohttp 的 ClientResponseError 异常对象不携带 body，
+                # 也没有 .text()/.json() 方法，因此不能依赖 raise_for_status()
+                # 之后再去取 body。这里手动检查状态码并读取上游错误内容。
+                if response.status >= 400:
+                    return await self._build_error_response(response)
 
                 response_data = await response.json()
                 logger.info(f"Successfully received response from Anthropic API")
@@ -567,21 +587,6 @@ class AnthropicRequestHandler:
                     "message": "Request to Anthropic API timed out after 120 seconds"
                 }
             }
-
-        except aiohttp.ClientResponseError as e:
-            logger.error(f"HTTP error from Anthropic API: {e.status} - {await e.text()}")
-            error_response = {
-                "error": {
-                    "type": "api_error",
-                    "message": f"Anthropic API returned status {e.status}"
-                }
-            }
-            if e.headers.get('content-type', '').startswith('application/json'):
-                try:
-                    error_response = await e.json()
-                except:
-                    pass
-            return error_response
 
         except aiohttp.ClientError as e:
             logger.error(f"Request error: {str(e)}")
@@ -600,6 +605,37 @@ class AnthropicRequestHandler:
                     "message": f"Internal server error: {str(e)}"
                 }
             }
+
+    @staticmethod
+    async def _build_error_response(response: aiohttp.ClientResponse) -> Dict[str, Any]:
+        """从上游错误响应中读取 body 并构造错误返回。
+
+        必须在响应的 async with 上下文仍然打开时调用（此时才能读取 body）。
+        如果上游返回的是合法的 JSON 错误体，则原样透传；否则包装成统一错误结构。
+        """
+        status = response.status
+        content_type = response.headers.get('content-type', '')
+
+        try:
+            body_text = await response.text()
+        except Exception as read_err:
+            body_text = f"<failed to read upstream body: {read_err}>"
+
+        logger.error(f"HTTP error from upstream API: {status} - {body_text}")
+
+        # 优先透传上游的 JSON 错误体（Anthropic 错误格式）
+        if content_type.startswith('application/json'):
+            try:
+                return json.loads(body_text)
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+        return {
+            "error": {
+                "type": "api_error",
+                "message": f"Upstream API returned status {status}: {body_text}"
+            }
+        }
 
     async def close(self):
         """清理资源"""
